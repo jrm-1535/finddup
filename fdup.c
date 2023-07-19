@@ -7,29 +7,39 @@
 
 void help( void )
 {
-    printf( "lsame -h -c -r -i -ic -a path\n\n" );
-    printf( "look for multiple instances of the same file content in a directory and sub-directories\n\n" );
-    printf( "options:\n" );
-    printf( "   -h  print this help message and exit\n" );
-    printf( "   -c  compare file contents. By default, check only if file size are the same\n" );
-    printf( "   -r  remove some of the same files. By default, just list their names\n" );
-    printf( "   -i  interactive removal: ask which file(s) to remove, if any. This is the default for -r\n" );
+    printf( "fdup -h -c -r -i -ic -a path\n\n" );
+    printf( "look for multiple instances of the same file content in a\n" );
+    printf( "directory and its sub-directories\n\n" );
+    printf( "Options:\n" );
+    printf( "   -h  print this help message and exit.\n" );
+    printf( "   -c  compare file contents. By default, check only if file\n");
+    printf( "       size are the same.\n" );
+    printf( "   -r  remove some of the same files. By default, just list\n" );
+    printf( "       their names.\n" );
+    printf( "   -i  interactive removal: ask which file(s) to remove, if\n" );
+    printf( "       any. This is the default for -r\n" );
     printf( "   -ic interactive removal with extra confirmation\n" );
-    printf( "   -a  automatic removal of all identical files but one\n\n");
+    printf( "   -a  automatic removal of all identical files but one\n\n" );
 
-    printf( "path is the pathname of the root directory to scan for identical files\n" );
-    printf( "If path is absent, the current directory is used instead\n\n" );
-    printf( "notes:\n" );
-    printf( "   With no option selected, lsame displays the path of all files with the same size\n" );
-    printf( "   To check if file contents are truly identical, select the option -c\n\n" );
-    printf( "   Options -r, -i, -ic and -a are ignored if option -c is not selected\n\n" );
-    printf( "   Option -r tries to remove some identical files, depending on options -i, -ic or -a\n\n" );
-    printf( "   Options -i, -ic and -a are ignored if options -c and -r are not both selected.\n" );
-    printf( "   Option -i is the default if -r is selected and none of -ic or -a is selected\n" );
-    printf( "   Option -i allows selection among a list of identical files of which file(s), if any\n" );
-    printf( "   Option -ic requires a confirmation after the selection of file(s) to remove\n\n" );
-    printf( "   Option -a automatically removes all files but the one with the shortest name\n" );
-    printf( "   This will remove files possibly in different sub-directories\n");
+    printf( "path is the pathname of the root directory to scan for identical\n" );
+    printf( "files. If path is absent, the current directory is used instead.\n\n" );
+    printf( "Notes:\n" );
+    printf( "   With no option selected, fdup displays the path of all files\n" );
+    printf( "   with the same size. To check if file contents are truly\n" );
+    printf( "   identical, select the option -c.\n\n" );
+    printf( "   Options -r, -i, -ic and -a are ignored if option -c is not\n" );
+    printf( "   selected.\n\n" );
+    printf( "   Option -r tries to remove some identical files, depending on\n" );
+    printf( "   options -i, -ic or -a:\n\n" );
+    printf( "     - Option -i allows selection among a list of identical files\n" );
+    printf( "       of which file(s) to remove, if any. It is the default if\n" );
+    printf( "       -r is selected and none of -ic or -a is selected.\n" );
+    printf( "     - Option -ic requires a confirmation after the selection of\n" );
+    printf( "       file(s) to remove.\n" );
+    printf( "     - Option -a automatically removes all files but the one with\n" );
+    printf( "       the shortest name. This removes files possibly in multiple\n" );
+    printf( "       sub-directories\n\n");
+    printf( "   Options -i, -ic and -a are ignored if option -r is not selected.\n" );
     printf( "   Options -a and -i or -ic are exclusive.\n\n" );
 }
 

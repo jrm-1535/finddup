@@ -13,16 +13,16 @@ STD := -std=c11 -D_DEFAULT_SOURCE
 CFLAGS := $(STD) $(DEBUG) $(WARNINGS) $(OPTIMIZE) $(PROFILE) $(DIRS)
 CC := gcc $(GDEFS)
 
-all: lsame
+all: fdup
 
-lsame.o:   lsame.c comp.h
-
-lsame:  lsame.o comp.o $(LIBS)
+fdup:  fdup.o comp.o $(LIBS)
 	    $(CC) $(CFLAGS) -o $@ $^
+
+fdup.o:   fdup.c comp.h
 
 comp.o: comp.c comp.h
 
 .PHONY: clean
 clean:	  
-	  rm *.[o] lsame
+	  rm *.[o] fdup
 
