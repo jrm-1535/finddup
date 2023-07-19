@@ -1,0 +1,4 @@
+
+Tool to search for (and remove) duplicate files in a directory and its
+sub-directories. The tool ignores the file names, but checks the size
+and actual content of files to determine if they are identical.
