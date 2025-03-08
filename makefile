@@ -1,5 +1,5 @@
 #
-# Makefile for lsame
+# Makefile for fdup and fmis
 #
 
 LIBS := ../baselib/baselib.a
@@ -13,16 +13,21 @@ STD := -std=c11 -D_DEFAULT_SOURCE
 CFLAGS := $(STD) $(DEBUG) $(WARNINGS) $(OPTIMIZE) $(PROFILE) $(DIRS)
 CC := gcc $(GDEFS)
 
-all: fdup
+all: fdup fmis
 
 fdup:  fdup.o comp.o $(LIBS)
+	    $(CC) $(CFLAGS) -o $@ $^
+
+fmis:  fmis.o comp.o $(LIBS)
 	    $(CC) $(CFLAGS) -o $@ $^
 
 fdup.o:   fdup.c comp.h
 
 comp.o: comp.c comp.h
 
+fmis.o:   fmis.c comp.h
+
 .PHONY: clean
 clean:	  
-	  rm *.[o] fdup
+	  rm *.[o] fdup fmis
 

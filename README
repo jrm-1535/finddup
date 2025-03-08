@@ -1,4 +1,17 @@
 
-Tool to search for (and remove) duplicate files in a directory and its
-sub-directories. The tool ignores the file names, but checks the size
-and actual content of files to determine if they are identical.
+fdup
+
+Tool to search for (and possibly remove) duplicate files in several directories
+and their sub-directories. The tool ignores the file names, but checks the size
+and actual content of files to determine if they are identical. By default it
+shows all duplicates found in those directories, but it can also be used for a
+specific target file or a target directory and show only duplicates for that
+target or those targets.
+
+fmis
+
+Tool to find out which target files do not belong in given directories and
+their sub-directories. The tool ignores the file names, but checks the size
+and actual content of files to determine if they are identical. Target can be
+a single file or files in a directory and its sub-directories.
+
