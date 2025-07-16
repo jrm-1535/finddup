@@ -4,7 +4,24 @@
 
 #include <stdlib.h>
 #include <stdbool.h>
+
 #include "map.h"
+
+// exit codes
+#define NO_ERROR            0
+#define ARGUMENT_ERROR      1
+#define FILE_IO_ERROR       2
+#define NO_MEMORY_ERROR     3
+#define INTERNAL_ERROR      4
+
+// initial dynamic structure sizes
+#define INITIAL_HASH_SIZE   2048
+#define MAX_COLLISIONS      6
+
+// defsult viewer for showing file contents
+#define IMAGE_VIEWER    "eom"
+#define TEXT_VIEWER     "xed"
+#define PDF_VIEWER      "xreader"
 
 typedef struct {
     char        *path;
@@ -14,7 +31,7 @@ typedef struct {
 typedef struct {
     search_t    *paths;
     search_t    *target;
-    bool        absent, compare, remove, confirm;
+    bool        compare, remove, confirm;
 } args_t;
 
 static inline void error( char *msg )
@@ -61,7 +78,10 @@ static inline void free_target_n_paths( args_t *args )
 }
 
 extern map_t *collect_same_size_files( args_t *args );
-extern void process_same_size_files( map_t *map, args_t *args );
+
+extern void process_duplicates( map_t *map, args_t *args );
+extern void search_targets( map_t *map, args_t *args );
+
 extern void free_collected_data( map_t *map );
 
 #endif /* __COMP_H__ */

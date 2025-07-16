@@ -9,22 +9,15 @@
 #include <errno.h>
 #include <stdint.h>
 #include <assert.h>
+#include <magic.h>
 
-#define TIME_MEASURE 0
-
-#if TIME_MEASURE
+#ifdef TIME_MEASURE
 #include <time.h>   // only for timing measurements
 #endif
 
 #include "comp.h"
 
-/*
-    Use a simple map with file size as key. Since multiple files can have the
-    same size, the data is a slice of all file paths with the same size.
-
-    key = size -> data = slice of paths allocated in memory
-*/
-#if TIME_MEASURE
+#ifdef TIME_MEASURE
 #define SEC_TO_NANOSEC(s)       ((s)*1000000000)
 #define NANOSEC_TO_MILLISEC(n)  ((n)/1000000)
 static int64_t get_nanosecond_timestamp( void )
@@ -40,30 +33,31 @@ static int64_t get_nanosecond_timestamp( void )
     }
     return nanoseconds;
 }
-
-uint64_t file_stat_spent = 0;
 #endif
 
-// called for each path when traversing directories.
-// return -1 in case of error, aborting the traversal,
-//         0 if path is not used for other purpose, allowing it to be freed
-//        +1 if path must NOT be freed by traverse_directory
-typedef int (*process_file_t)( char *path, size_t size, void *context );
+static void *malloc_or_exit( size_t size )
+{
+    void *d = malloc( size );
+    if ( NULL == d ) {
+        exit( NO_MEMORY_ERROR );
+    }
+    return d;
+}
 
-// traverse directories, from the root path, according to the argument nosub.
-// if nosub is true, no subdirectory is entered, For each path in a directory,
-// the function process is called with the given context.
+// return true if path is NOT used for other purpose, allowing it to be freed
+typedef bool (*process_file_t)( char *path, size_t size, void *context );
+
 static void traverse_directory( char *path, bool nosub,
-                                process_file_t process, void *context)
+                                process_file_t process, void *ctxt)
 {
 //    printf( "Entering directory %s\n", path );
     DIR *ref_dir = opendir( path );
     if ( NULL == ref_dir ) {
         printf( "Unable to open directory %s (errno %d) - exiting\n", path, errno );
-        exit(1);
+        exit(FILE_IO_ERROR);
     }
 
-    while ( 1 ) {
+    while ( true ) {
         struct dirent *ref_de = readdir( ref_dir );
         if ( NULL == ref_de ) {
             break;
@@ -77,50 +71,31 @@ static void traverse_directory( char *path, bool nosub,
         }
 
         int cur_path_size = strlen(path);
-        char *new_path = malloc( cur_path_size + strlen(ref_dename) + 2 );
+        char *new_path = malloc_or_exit( cur_path_size + strlen(ref_dename) + 2 );
         strcpy( new_path, path );
         if ( '/' != path[cur_path_size-1]) {
             new_path[cur_path_size] = '/';
             ++cur_path_size;
         }
         strcpy( new_path + cur_path_size, ref_dename );
-
         struct stat stat_data;
         int res;
 
-#if TIME_MEASURE
-        uint64_t before_stat;
-#endif
         switch ( ref_detype ) {
         case DT_REG:
-#if TIME_MEASURE
-        {
-            before_stat = get_nanosecond_timestamp();
-#endif
             res = stat( new_path, &stat_data );
-#if TIME_MEASURE
-            file_stat_spent += get_nanosecond_timestamp() - before_stat;
-        }
-#endif
             if ( res != 0 ) {
                 printf( "unable to stat regular file %s\n", new_path );
-                exit(1);
+                exit(FILE_IO_ERROR);
             }
 //            printf( "size %ld, path %s\n", stat_data.st_size, new_path );
-            switch ( process( new_path, stat_data.st_size, context ) ) {
-            case -1:    // error, abort
+            if ( process( new_path, stat_data.st_size, ctxt ) ) {
                 free( new_path );
-                return;
-            case 0:
-                free( new_path );
-                break;
-            default:
-                break;
             }
             break;
         case DT_DIR:
             if ( ! nosub ) {
-                traverse_directory( new_path, nosub, process, context );
+                traverse_directory( new_path, nosub, process, ctxt );
             }
             free( new_path );
             break;
@@ -151,441 +126,578 @@ static bool bin_compare( FILE *f1, FILE *f2 )
     return true;
 }
 
-static unsigned long interactive_delete_duplicates( const char **path_array,
-                                                    size_t  n_paths, bool confirm )
+/*
+    Use a simple map with file size as key. Since multiple files can have
+    the same size, the data is linked list of file paths with the same size.
+
+    key = size -> data = name_list_t of names allocated in memory
+*/
+
+// used for storing list of files with the same size
+// The prev list is circular with the head item pointing to the last one
+// this allow O(0) access to the last item during creation
+typedef struct _name_list {
+    struct _name_list   *next;  // regular linked list ending with NULL
+    struct _name_list   *prev;  // circular linked list during creation
+    char                *name;
+} name_list_t;
+
+// once created the orignal list is never directly modified. Instead, each
+// time lists need modification, they are first duplicated. After duplication
+// the prev linked list is not circular anymore (head->prev is NULL)
+static name_list_t *duplicate_list( const name_list_t *l )
 {
-    bool    *del_index_array = malloc( sizeof(bool) * n_paths );
-    memset( del_index_array, 0, sizeof(bool) * n_paths );
-    char *buffer = malloc( 20 * n_paths ); // index size with some extra space
-
-    printf( "> Enter the space separated list of name indexes to remove: " );
-    fflush( stdout );
-    bool do_remove = false;
-    int n = read( fileno(stdin), buffer, 20 * n_paths );
-
-    unsigned long removed = 0;
-    if ( n > 1 ) {
-        --n;                    // skip final char (\n)
-        char *start = buffer;
-        while ( start - buffer < n ) {
-            while ( *start == ' ' && start - buffer < n ) ++start;
-            char *end;
-            long int index = strtol( start, &end, 10 );
-            if ( end == start ) {
-                break;  // consider as do not remove
-            }
-            //  printf( "index %ld n_paths %d\n", index, tct->n_paths );
-            if ( index >= 0 || (size_t)index < n_paths ) {
-                del_index_array[index] = true;
-                do_remove = true;
-            }
-            start = end;
-            while ( *start == ' ' && start - buffer < n ) ++start;
+    name_list_t *dl, *p;
+    dl = p = NULL;
+    for ( const name_list_t *item = l; NULL != item; item = item->next ) {
+        name_list_t *d = malloc_or_exit( sizeof( name_list_t ) );
+        d->name = item->name;
+        d->prev = p;
+        d->next = NULL;
+        if ( NULL == dl ) {
+            dl = d;
+        } else {
+            p->next = d;
         }
-        if ( do_remove && confirm ) {
-            printf( " Confirm removing files:\n" );
-            for ( size_t i = 0; i < n_paths; ++i ) {
-                if ( del_index_array[i] ) {
-                    printf( "  %s\n", path_array[i] );
-                }
-            }
-            printf( "> Enter Y to remove: ");
-            fflush( stdout );
-            do_remove = false;
-            int n = read( fileno(stdin), buffer, 10 );
-            if ( n == 2 && (buffer[0] & 0x5f) == 'Y' ) {
-                do_remove = true;
-            }
+        p = d;
+    }
+    return dl;
+}
+
+// shallow free, does not free the file name here (still in use in the
+// original list)
+static void free_duplicate_list( name_list_t *l)
+{
+    name_list_t *entry = l;
+    while ( NULL != entry ) {
+        name_list_t *to_remove = entry;
+        entry = entry->next;
+        free( to_remove );
+    }
+}
+
+static magic_t open_magic_lib( void )
+{
+	static magic_t magic_cookie;
+
+	/*MAGIC_MIME tells magic to return a mime of the file, but you can specify different things*/
+	magic_cookie = magic_open(MAGIC_MIME);
+	if (magic_cookie == NULL) {
+        printf("unable to initialize magic library\n");
+        exit( INTERNAL_ERROR );
+	}
+//    printf("Loading default magic database\n");
+    if (magic_load(magic_cookie, NULL) != 0) {
+        printf("cannot load magic database - %s\n", magic_error(magic_cookie));
+        magic_close(magic_cookie);
+        exit( INTERNAL_ERROR );
+    }
+    return magic_cookie;
+}
+
+static void close_magic_lib( magic_t magic_cookie )
+{
+	magic_close(magic_cookie);
+}
+
+static size_t get_escaped_path_len( const char * path )
+{
+    // shells requie to escape some characters, such as '('
+    size_t sz = 0;
+    while ( 0 != *path ) {
+        switch( *path++ ) {
+        case '(': case ')': case '\'': case ';':
+            sz += 2;
+            break;
+        default:
+            ++sz;
+            break;
         }
     }
-    if ( do_remove ) {
-        for ( size_t i = 0; i < n_paths; ++i ) {
-            if ( del_index_array[i] ) {
-                if ( -1 == remove( path_array[i] ) ) {
-                    printf( "Failed to remove %s\n", path_array[i] );
-                } else {
-                    ++removed;
-                }
-            }
-        }
-    } else if ( confirm ) {
-        printf( "Leaving all files\n" );
-    }
+    return sz;
+}
 
+static bool write_escaped_path( char *buffer, size_t len, const char *path )
+{
+    size_t i = 0;
+    while ( 0 != *path && len > 1) {
+        switch( *path ) {
+        case '(': case ')': case '\'': case ';':
+            buffer[i++] = '\\';
+            break;
+        default:
+            break;
+        }
+        buffer[i++] = *path;
+        ++path;
+    }
+    if ( 0 != *path ) {
+        return false;\
+    }
+    buffer[i] = '\0';
+    return true;
+}
+
+static void run_viewer( const char *viewer, const char * path )
+{
+    size_t vlen = strlen( viewer );
+    size_t plen = get_escaped_path_len( path );
+    size_t sz = vlen + plen + 2;
+    char *buffer = malloc_or_exit( sz );
+    int n = snprintf( buffer, sz, "%s ", viewer );
+    if ( n == (int)(vlen + 1) && write_escaped_path( &buffer[n], 1 + plen, path ) ) {
+//        printf( "command %s\n", buffer );
+        printf( "It may take a while to view the file - Exit viewer to continue\n" );
+        system( buffer );
+    }
     free( buffer );
-    free( del_index_array );
-    return removed;
+}
+
+static void view_file( magic_t cookie, const char *path )
+{
+    const char *desc = magic_file( cookie, path);
+//	printf("%s\n", desc);
+    const char *known_mime_types[] =
+        { "image/bmp", "image/gif;", "image/jpeg", "image/png",
+          "image/apng", "image/tiff",
+          "text/plain", "text/csv", "text/xml", "application/xml",
+          "application/json", "text/html",
+           "application/pdf" };
+    const char *default_viewer[] =
+        { IMAGE_VIEWER, IMAGE_VIEWER, IMAGE_VIEWER, IMAGE_VIEWER,
+          IMAGE_VIEWER, IMAGE_VIEWER,
+          TEXT_VIEWER, TEXT_VIEWER, TEXT_VIEWER, TEXT_VIEWER,
+          TEXT_VIEWER, TEXT_VIEWER,
+          PDF_VIEWER
+        };
+    for ( size_t i = 0; i < sizeof( known_mime_types ) / sizeof( char * ); ++i ) {
+        if ( 0 == strncmp( desc, known_mime_types[i],
+                          strlen( known_mime_types[i] ) ) ) {
+//            printf( "Viewer: %s\n", default_viewer[i] );
+            run_viewer( default_viewer[i], path );
+            return;
+        }
+    }
+    printf( "No viewer defined for %s\n", desc );
 }
 
 typedef struct {
-    unsigned long   instances;
-    unsigned long   total;
-    unsigned long   removed;
-    bool            compare;
-    bool            remove;
-    bool            confirm;
-} process_args_t;
+    const char  *path;
+    map_t       *map;
+    magic_t     cookie;
+    size_t      redundant;
+    bool        compare;
+    bool        remove;
+    bool        confirm;
+    bool        zero;
 
-#if TIME_MEASURE
-uint64_t file_compare_spent = 0;
-#endif
+} target_context_t;
 
-static void compare_redundant( slice_t *paths, size_t size, process_args_t *pargs )
+// return true to stop immediately, false to keep processing files
+static bool interactive_remove_files( target_context_t *tc,
+                                      const name_list_t *names, int nnames )
 {
-    if ( NULL == pargs || NULL == paths ) return;
+    while ( true ) {
+        printf( "> Enter v to view content, x to exit, or a space separated "
+                "list of name indexes to remove or nothing to skip removing: " );
+        fflush( stdout );
+        char *buffer = malloc_or_exit( 20 * nnames );   // some extra space
+        int n = read( fileno(stdin), buffer, 20 * nnames );
+        if ( n > 1 ) {
+            char **to_remove = malloc_or_exit( sizeof(char *) * (nnames + 1) );
+            char *end = buffer;
+            int  k = 0;
+            --n;
 
-    size_t n_items = slice_len( paths );
-    const char **same_items = malloc( n_items * sizeof( char *) );
-
-    if ( NULL == same_items ) {
-        printf( "Cannot allocate same item array, aborting\n" );
-        exit(2);
-    }
-
-    for ( size_t i = 0; i < n_items; ++i ) {
-        size_t n_same_items = 0;
-        const char *path_1 = pointer_slice_item_at( paths, i );
-        if ( NULL != path_1 ) {
-            same_items[n_same_items++] = path_1;
-            if ( pargs->compare ) {
-                FILE *f1 = fopen( path_1, "rb" );
-                if ( NULL == f1 ) {
-                    printf( "Failed to open file %s (errno %d) exiting\n",
-                            path_1, errno );
-                    exit(1);
+            while ( end - buffer < n ) {
+                while ( *end == ' ' && end - buffer < n ) ++end;
+                if ( 'x' == *end || 'X' == *end ) {
+                    return true;
                 }
-                for ( size_t j = i+1; j < n_items; ++j ) {
-                    const char *path_2 = pointer_slice_item_at( paths, j );
-                    if ( NULL != path_2 ) {
-                        FILE *f2 = fopen( path_2, "rb" );
-                        if ( NULL == f2 ) {
-                            printf( "Failed to open file %s (errno %d) exiting\n",
-                                    path_2, errno );
-                            exit(1);
-                        }
-#if TIME_MEASURE
-                        uint64_t before_compare = get_nanosecond_timestamp();
-#endif
-                        if ( bin_compare( f1, f2 ) ) {              // same: copy item to
-                            same_items[n_same_items++] = path_2;    // same_items and
-                            pointer_slice_write_item_at( paths, j, NULL );  // remove from paths
-                        }
-#if TIME_MEASURE
-                        file_compare_spent += get_nanosecond_timestamp() - before_compare;
-#endif
-                        fclose( f2 );
-                    }
+                if ( 'v' == *end || 'V' == *end ) {
+                    view_file( tc->cookie, names[0].name );
+                    break;
                 }
-                fclose( f1 );
-
-            } else  {
-                for ( size_t j = i+1; j < n_items; ++j ) {
-                    const char *path_2 = slice_item_at( paths, j );
-                    if ( NULL != path_2 ) {
-                        same_items[n_same_items++] = path_2;
-                        pointer_slice_write_item_at( paths, j, NULL );
+                long int val = strtol( end, &end, 10 );
+//                printf( "val %ld nnames %d\n", val, nnames );
+                if ( val < nnames ) {
+                    const name_list_t *cur = names;
+                    for ( int i = 0; i < val; ++i ) {
+                        cur = cur->next;
                     }
+                    to_remove[k++] = cur->name;
+                }
+                while ( *end == ' ' && end - buffer < n ) ++end;
+            }
+            if ( k > 0 ) {
+                bool do_remove = false;
+                if ( tc->confirm ) {
+                    printf( " Confirm removing files:\n" );
+                    for ( int i = 0; i < k; ++i ) {
+                        printf( "  %s\n", to_remove[i] );
+                    }
+                    printf( "> Enter Y or N: ");
+                    fflush( stdout );
+                    int n = read( fileno(stdin), buffer, 10 );
+                    if ( n == 2 && (buffer[0] & 0x5f) == 'Y' ) {
+                        do_remove = true;
+                    }
+                } else {
+                    do_remove = true;
+                }
+                if ( do_remove ) {
+                    for ( int i = 0; i < k; ++i ) {
+                        if ( -1 == remove( to_remove[i] ) ) {
+                            printf( "Failed to remove %s\n", to_remove[i] );
+                        }
+                    }
+                    free(to_remove);
+                    free( buffer );
+                    return false;
                 }
             }
-
-            if ( n_same_items > 1 ) {
-                ++pargs->instances;
-                pargs->total += n_same_items;
-                printf( "size %ld\n", size );
-                for ( size_t j = 0; j < n_same_items; ++ j ) {
-                    printf( "  %s\n", same_items[j] );
-                }
-                if ( pargs->remove ) {              // ask which names to remove
-                    pargs->removed +=
-                        interactive_delete_duplicates( same_items, n_same_items, pargs->confirm );
-                }
-            }
+            free(to_remove);
+        } else {
+            printf( "Leaving both files\n" );
+            free( buffer );
+            return false;
         }
     }
 }
 
-static bool compare_collected_entries( uint32_t index, const void *key,
-                                       const void *data, void *ctxt )
+static bool compare_all( target_context_t *tc, size_t size,
+                         const name_list_t *name_list )
+{
+    // if nothing to compare ()0 or 1 name), just return
+    if ( NULL == name_list || NULL == name_list->next ) return false;
+
+    // list is modified below - must make a copy of the original map content
+    name_list_t *list = duplicate_list( name_list );
+    name_list_t *same;
+
+    bool stop = false;
+    while ( true ) {
+        same = list;        // move head of list in same (tentatively)
+        list = list->next;  // remove head from list
+        list->prev = NULL;
+        same->next = NULL;
+        same->prev = NULL;
+        name_list_t *last_same = same;
+
+        FILE *f1 = fopen( same->name, "rb" );
+        if ( NULL == f1 ) {
+            printf( "Failed to open file %s (errno %d) exiting\n",
+                    same->name, errno );
+            exit(FILE_IO_ERROR);
+        }
+
+        name_list_t *next_item;
+        for ( name_list_t *item = list; item; item = next_item ) {
+            FILE *f2 = fopen( item->name, "rb" );
+            if ( NULL == f2 ) {
+                printf( "Failed to open file %s (errno %d) exiting\n",
+                        item->name, errno );
+                exit(FILE_IO_ERROR);
+            }
+            next_item = item->next;
+            if ( bin_compare( f1, f2 ) ) {  // same: move item to same list
+                if ( NULL != item->prev ) {
+                    item->prev->next = item->next;
+                } else {
+                    list = item->next;
+                }
+                if ( NULL != item->next ) {
+                    item->next->prev = item->prev;
+                }
+                last_same->next = item;
+                item->next = NULL;
+                item->prev = last_same;
+                last_same = item;
+            }
+            fclose( f2 );
+        }
+        if ( same->next ) { // at least 2 names in same list
+            name_list_t *cur = same;
+            int nnames = 0;
+            printf( "size %ld\n", size );
+            while ( cur ) {
+                printf( "  %s\n", cur->name );
+                ++nnames;
+                cur = cur->next;
+            }
+            tc->redundant += nnames - 1;    // all but one are redundant
+            if ( tc->remove ) {    // ask which names to remove (sep with ' ')
+                stop = interactive_remove_files( tc, same, nnames );
+            }
+        }
+        fclose( f1 );
+        free_duplicate_list( same );
+        if ( stop ) {
+            free_duplicate_list( list );
+            break;
+        }
+        if ( NULL == list || NULL == list->next ) {
+            if ( NULL != list ) {
+                free_duplicate_list( list );
+            }
+            break;      // single left in original list cannot match any other
+        }
+    }
+    return stop;
+}
+
+// called for every map entry, unless it returns true
+static bool visit_entries( uint32_t index, const void *key,
+                           const void *data, void *ctxt )
 {
     (void)index;
-    process_args_t *pargs = (process_args_t *)ctxt;
-    slice_t *paths = (slice_t *)data;
-    if ( slice_len( paths ) > 1 ) { // duplicates exist
-        if ( pargs->compare ) {     // compare, display and possibly remove
-            compare_redundant( paths, (size_t)key, pargs );
-        } else {                    // just display
-            printf( "size %ld\n", (size_t)key );
-            for ( size_t i = 0; i < slice_len( paths ); ++ i ) {
-                printf( " %s\n", (const char *)pointer_slice_item_at( paths, i) );
-            }
+    target_context_t *tc = ctxt;
+    size_t size = (size_t)key;
+    const name_list_t *list = data;
+
+    if ( tc->compare ) {        // compare all files with same size
+        return compare_all( tc, size, list );
+    } else if ( list->next ) {  // list all files with same size if more than 1
+        printf( "size %ld\n", size );
+        for ( const name_list_t *ntry = list; NULL != ntry; ntry = ntry->next ) {
+            printf( "  %s\n", ntry->name );
+            ++tc->redundant;
         }
     }
     return false;
 }
 
-typedef struct {
-    char            *name;
-    FILE            *target;
-    size_t          size;
-
-    unsigned long   instances;
-    unsigned long   total;
-    unsigned long   removed;
-
-    map_t           *map;
-
-    bool            absent;
-    bool            compare;
-    bool            remove;
-    bool            confirm;
-
-    bool            zero;
-} target_context_t;
-
-static void is_duplicate( const slice_t *paths, target_context_t *tcp )
+// compare single file/dir target to all duplicates
+static bool compare_target( char *path, size_t size, void *context )
 {
-    size_t n_items = slice_len( paths );
-    const char **path_array = malloc( (1+n_items) * sizeof( char *) );
-    if ( NULL == path_array ) {
-        printf( "Cannot allocate path array, aborting\n" );
-        exit(2);
-    }
-    path_array[0] = tcp->name;
-    size_t n_paths = 1;
-
-    for ( size_t i = 0; i < slice_len( paths ); ++i ) {
-        const char *path = pointer_slice_item_at( paths, i );
-        bool dup = ! tcp->compare;
-        if ( ! dup ) {
-            FILE *f = fopen( path, "rb" );
-#if TIME_MEASURE
-            uint64_t before_compare = get_nanosecond_timestamp();
-#endif
-            dup = bin_compare( tcp->target, f );
-#if TIME_MEASURE
-            file_compare_spent += get_nanosecond_timestamp() - before_compare;
-#endif
-            fclose( f );
-        }
-        if ( dup ) {
-            path_array[n_paths++] = path;
-        }
-    }
-    if ( n_paths > 1 ) {    // duplicates exist
-                            // show and possibly remove them
-        ++tcp->instances;
-        tcp->total += n_paths;
-        printf( "size %ld\n", tcp->size );
-        for ( size_t i = 0; i < n_paths; ++ i ) {
-            printf( " %s\n", path_array[i] );
-        }
-        if ( tcp->remove ) {
-            tcp->removed += interactive_delete_duplicates( path_array, n_paths, tcp->confirm );
-        }
-    }
-    free( path_array );
-}
-
-static void is_absent( const slice_t *paths, target_context_t *tcp )
-{
-    bool match = false;
-    for ( size_t i = 0; i < slice_len( paths ); ++i ) {
-        const char *path = pointer_slice_item_at( paths, i );
-
-        FILE *f = fopen( path, "rb" );
-#if TIME_MEASURE
-        uint64_t before_compare = get_nanosecond_timestamp();
-#endif
-        if ( ! tcp->compare || bin_compare( tcp->target, f ) ) {
-            match = true;   // at least one matching file found
-        }
-#if TIME_MEASURE
-        file_compare_spent += get_nanosecond_timestamp() - before_compare;
-#endif
-        fclose( f );
-    }
-    if ( ! match ) {
-        ++tcp->instances;
-        printf( "%s content is not found in any path\n", tcp->name );
-    }
-}
-
-static int check_target_content( char *path, size_t size, void *context )
-{
-    target_context_t *tcp = context;
+    target_context_t *tc = context;
     if ( 0 == size ) {
-        if ( tcp->zero ) {
+        if ( tc->zero ) {
             printf( "Empty target file %s\n", path );
         }
-        return 0;
+        return true;
     }
-    tcp->name = path;
-    tcp->size = size;
-    tcp->target = fopen( path, "rb" );
+    const name_list_t *list = map_lookup_entry( tc->map, (void *)size );
+    if ( NULL == list ) {   // no file matching the target file size
+        return true;
+    }
 
-    if ( NULL == tcp->target ) {
-        printf( "Failed to open target file %s (errno %d) exiting\n",
-                path, errno );
-        exit(1);
-    }
-    const slice_t * paths = map_lookup_entry( tcp->map, (void *)size );
-    if ( NULL != paths ) {
-        if ( tcp->absent ) {
-            is_absent( paths, tcp );
-        } else {
-            is_duplicate( paths, tcp );
+    if ( ! tc->compare ) {
+        printf( "size %ld\n  <target> %s\n", size, path );
+        for ( const name_list_t *ntry = list; NULL != ntry; ntry = ntry->next ) {
+            printf( "  %s\n", ntry->name );
         }
-    } else if ( tcp->absent ) {
-        ++tcp->instances;
-        printf( "%s content is not found in any path\n", tcp->name );
+        return false;
     }
-    fclose( tcp->target );
-    return 0;
+
+    FILE *f1 = fopen( path, "rb" );
+    if ( NULL == f1 ) {
+        printf( "Error: Failed to open target file %s (errno %d) exiting\n",
+                path, errno );
+        exit(FILE_IO_ERROR);
+    }
+
+    tc->path = path;
+    // binary content comparison is required
+    int nnames = 0;
+    name_list_t *duplicates, *prev;
+    duplicates = prev = NULL;
+    for ( const name_list_t *ntry = list; NULL != ntry; ntry = ntry->next ) {
+        FILE *f2 = fopen( ntry->name, "rb" );
+        if ( NULL == f2 ) {
+            printf( "Failed to open file %s (errno %d) exiting\n",
+                    ntry->name, errno );
+            exit(FILE_IO_ERROR);
+        }
+        if ( bin_compare( f1, f2 ) ) {  // same content
+            ++tc->redundant;
+            if ( 0 == nnames ) {
+                printf( "size %ld\n  <target> %s\n", size, path );
+                if ( tc->remove ) {
+                    duplicates = malloc_or_exit( sizeof( name_list_t ) );
+                    duplicates->name = path;
+                    duplicates->next = NULL;
+                    duplicates->prev = NULL;
+                    prev = duplicates;
+                }
+            }
+            printf( "  %s\n", ntry->name );
+            if ( tc->remove ) {
+                name_list_t *to_remove = malloc_or_exit( sizeof( name_list_t ) );
+                to_remove->name = ntry->name;
+                to_remove->next = NULL;
+                to_remove->prev = prev;
+                prev->next = to_remove;
+                prev = to_remove;
+            }
+            ++ nnames;
+        }
+    }
+    fclose( f1 );
+    if ( tc->remove ) {
+        interactive_remove_files( tc, duplicates, nnames );
+    }
+    free_duplicate_list( duplicates );
+    return false;
 }
 
-extern void process_same_size_files( map_t *map, args_t *args )
+extern void process_duplicates( map_t *map, args_t *args )
 {
-#if TIME_MEASURE
-    file_stat_spent = 0;
+    magic_t magic = open_magic_lib( );
+#ifdef TIME_MEASURE
     uint64_t file_process_start = get_nanosecond_timestamp();
 #endif
-    if ( NULL != args->target ) {
-        target_context_t ctxt;
-        ctxt.map = map;
+    target_context_t tc;
+    tc.cookie = magic;
+    tc.map = map;
+    tc.redundant = 0;
+    tc.compare = args->compare;
+    tc.remove = args->remove;
+    tc.confirm = args->confirm;
 
-        ctxt.instances = 0;
-        ctxt.total = 0;
-        ctxt.removed= 0;
-
-        ctxt.zero = args->target->zero;
-        ctxt.absent = args->absent;
-
-        ctxt.compare = args->compare;
-        ctxt.remove = args->remove;
-        ctxt.confirm = args->confirm;
-
+    if ( NULL != args->target ) {   // single target file/dir case
         struct stat stat_data;
-        stat(args->target->path, &stat_data);
-        if ( S_ISREG( stat_data.st_mode ) ) {       // Handle regular file
-//            printf( "Target %s is a regular file\n", args->target->path );
-            if ( 0 == stat_data.st_size ) {
-                if ( args->target->zero ) {
-                    printf( "Empty target file %s\n", args->target->path );
-                }
-                return;
-            }
-            check_target_content( args->target->path, stat_data.st_size, &ctxt );
-
-        } else if ( S_ISDIR( stat_data.st_mode ) ){ // Handle directory
-//            printf( "Target %s is a directory\n", args->target->path );
-            ctxt.map = map;
+        if ( 0 != stat( args->target->path, &stat_data ) ) {
+            printf( "Error: unable to stat target file %s\n", args->target->path );
+            exit(FILE_IO_ERROR);
+        }
+        tc.zero = args->target->zero;
+        if ( S_ISREG( stat_data.st_mode ) ) {   // Handle single regular file
+            compare_target( args->target->path, stat_data.st_size, &tc );
+        } else if ( S_ISDIR( stat_data.st_mode ) ){ // Handle single directory
             traverse_directory( args->target->path, args->target->nosub,
-                                check_target_content, &ctxt );
+                                compare_target, &tc );
         } else {
             printf( "Target %s is a special file: mode 0x%x - exiting\n",
                     args->target->path, stat_data.st_mode );
         }
-        if ( ctxt.absent ) {
-            printf( "Found %ld target files that do not exist in any path\n",
-                   ctxt.instances );
-        } else {
-            printf( "Found %ld instances of redundant files, for a total of %ld redundant files\n",
-                    ctxt.instances, ctxt.total );
-            if ( ctxt.remove ) {
-                printf( "Removed %ld redundant files\n", ctxt.removed );
-            }
-        }
     } else {
-        process_args_t pargs;
-        pargs.instances = 0;
-        pargs.total = 0;
-        pargs.removed = 0;
-
-        pargs.compare = args->compare;
-        pargs.remove = args->remove;
-        pargs.confirm = args->confirm;
-
-        map_process_entries( map, compare_collected_entries, &pargs );
-        printf( "Found %ld instances of redundant files, for a total of %ld redundant files\n",
-                pargs.instances, pargs.total );
-        if ( pargs.remove ) {
-            printf( "Removed %ld redundant files\n", pargs.removed );
-        }
+        tc.path = NULL;
+        map_process_entries( map, visit_entries, (void *)&tc );
     }
-#if TIME_MEASURE
-    printf( "Time elapsed processing files %ld milliseconds\n", get_nanosecond_timestamp() - file_process_start );
-    printf( "  Time spent in file comparison: %ld nanoseconds\n", file_compare_spent );
-    printf( "  Time spent in file stat:       %ld nanoseconds\n", file_stat_spent );
+    if ( ! tc.remove ) {
+#ifdef TIME_MEASURE
+        printf( "Time elapsed processing files %ld milliseconds\n",
+                            get_nanosecond_timestamp() - file_process_start );
 #endif
+        printf( "Found %ld redundant files\n", tc.redundant );
+    }
+    close_magic_lib( magic );
 }
 
 typedef struct {
     map_t           *map;
-    unsigned long   count;
+    size_t          count;
     bool            zero;
-    bool            absent;
-    bool            compare;
-    bool            remove;
-    bool            confirm;
 } map_context_t;
 
-#if TIME_MEASURE
-static int64_t slice_append_spent = 0;
-static int64_t slice_creation_spent =0;
-#endif
+// called for a single target file, or for each target file in a directory
+// Always return true to free the target path if called from traverse_directory
+static bool check_target_content( char *path, size_t size, void *context )
+{
+    map_context_t *mcp = context;
+    if ( 0 == size ) {
+        if ( mcp->zero ) {
+            printf( "Empty target file %s\n", path );
+        }
+        return true;
+    }
+    FILE *target = fopen( path, "rb" );
+    if ( NULL == target ) {
+        printf( "Failed to open target file %s (errno %d) exiting\n",
+                path, errno );
+        exit(FILE_IO_ERROR);
+    }
+    const name_list_t *list = map_lookup_entry( mcp->map, (void *)size  );
+    bool found = false;
+    if ( NULL != list  ) {
+        for ( const name_list_t *entry = list; NULL != entry; entry = entry->next ) {
+            const char *name = entry->name;
+            FILE *f = fopen( name, "rb" );
+            bool match = bin_compare( target, f );  // at least one matching file found
+            fclose( f );
 
-#define MIN_SLICE_SIZE   4
-static int build_map( char *path, size_t size, void *context )
+            if ( match ) {
+                printf( " %s content is found as %s\n", path, name );
+                found = true;
+            }
+        }
+    }
+    if ( ! found ) {
+        printf( " %s content is not found in any path\n", path );
+    }
+    fclose( target );
+    return true;
+}
+
+extern void search_targets( map_t *map, args_t *args )
+{
+#ifdef TIME_MEASURE
+    uint64_t file_process_start = get_nanosecond_timestamp();
+#endif
+    if ( NULL != args->target ) {
+        map_context_t ctxt;
+        ctxt.map = map;
+        ctxt.zero = args->target->zero;
+        ctxt.count = 0;
+
+        struct stat stat_data;
+        if ( 0 != stat( args->target->path, &stat_data ) ) {
+            printf( "Error: unable to stat target file %s\n", args->target->path );
+            exit(FILE_IO_ERROR);
+        }
+        if ( S_ISREG( stat_data.st_mode ) ) {       // Handle regular file
+//            printf( "Target is a regular file\n" );
+            check_target_content( args->target->path, stat_data.st_size, &ctxt );
+
+        } else if ( S_ISDIR( stat_data.st_mode ) ) { // Handle directory
+//            printf( "Target is a directory\n" );
+            traverse_directory( args->target->path, args->target->nosub,
+                                check_target_content, &ctxt );
+        } else {
+            printf( "Warning: Target is a special file - skipping\n" );
+        }
+    }
+#ifdef TIME_MEASURE
+    printf( "Time elapsed processing files %ld milliseconds\n",
+                            get_nanosecond_timestamp() - file_process_start );
+#endif
+}
+
+static bool build_map( char *path, size_t size, void *context )
 {
     map_context_t *mcp = context;
 
-    if ( 0 != size ) {  // skip empty files as a map key cannot be 0
+    if ( 0 != size ) {
         ++mcp->count;
-        slice_t *paths = (slice_t *)map_lookup_entry( mcp->map, (void *)size );
-        if ( NULL == paths ) {
-#if TIME_MEASURE
-            int64_t before_creation = get_nanosecond_timestamp( );
-#endif
-            paths = new_slice( sizeof( char * ), MIN_SLICE_SIZE );
-#if TIME_MEASURE
-            slice_creation_spent += get_nanosecond_timestamp( ) - before_creation;
-#endif
-            if ( NULL != paths ) {
-                map_insert_entry( mcp->map, (void *)size, (void*)paths );
-            } // else it fails just below
-        }
-        // append path to existing paths slice,
-        // it fails if slice is NULL or can't be appended to
-#if TIME_MEASURE
-        int64_t before_append = get_nanosecond_timestamp( );
-#endif
-        if ( 0 != pointer_slice_append_item( paths, path ) ) {
-            printf( "Out of memory while building map" );
-            return -1;
-        }
-#if TIME_MEASURE
-        slice_append_spent += get_nanosecond_timestamp( ) - before_append;
-#endif
-        // do not free path here as it is the value in the
-        // hash table (while size is the key)
-        return 1;
-    }
-    if ( mcp->zero ) {
-        printf( "Empty file %s\n", path );
-    }
-    return 0;
-}
+        name_list_t *head = (void *)map_lookup_entry( mcp->map, (void *)size );
+        name_list_t *ntry = malloc_or_exit( sizeof( name_list_t ) );
+        ntry->name = path;
+        ntry->next = NULL;
 
-#define INITIAL_HASH_SIZE   2048
-#define MAX_COLLISIONS      10
+        if ( NULL == head ) {
+            ntry->prev = ntry;
+            map_insert_entry( mcp->map, (void *)size, (void*)ntry );
+        } else {
+            ntry->prev = head->prev;
+            head->prev->next = ntry;
+            head->prev = ntry;
+        }
+        return false;
+    } else {
+        if ( mcp->zero ) {
+            printf( "Empty file %s\n", path );
+        }
+    }
+    return true;
+}
 
 extern map_t *collect_same_size_files( args_t *args )
 {
     // By default start with a medium size map table.
-    // The collision threshold is very high on purpose, because we are
-    // creating a collision for each file with the same size (in addition
-    // to the actual collisions that a modulo can create).
-    map_t *map = new_map( NULL, NULL, INITIAL_HASH_SIZE, MAX_COLLISIONS );
+    // Map entries are defined as key=size, value = (name_list_t *)
+    map_t *map = new_map( NULL, NULL,
+                          INITIAL_HASH_SIZE, MAX_COLLISIONS );
     if ( NULL == map ) {
         return NULL;
     }
@@ -593,19 +705,16 @@ extern map_t *collect_same_size_files( args_t *args )
     map_context_t ctxt;
     ctxt.map = map;
     ctxt.count = 0;
-#if TIME_MEASURE
+#ifdef TIME_MEASURE
     int64_t start = get_nanosecond_timestamp( );
 #endif
     for ( search_t *sptr = args->paths; NULL != sptr->path; ++sptr ) {
         ctxt.zero = sptr->zero;
         traverse_directory( sptr->path, sptr->nosub, build_map, &ctxt );
     }
-#if TIME_MEASURE
+#ifdef TIME_MEASURE
     int64_t stop = get_nanosecond_timestamp( );
     printf( "Time elapsed building map: %ld milliseconds\n", NANOSEC_TO_MILLISEC(stop-start) );
-    printf( "  Time spent in slice creation:  %ld nanoseconds\n", slice_creation_spent );
-    printf( "  Time spent in slice appending: %ld nanoseconds\n", slice_creation_spent );
-    printf( "  Time spend in file stat:       %ld nanoseconds\n", file_stat_spent );
 #endif
     printf( "Traversed %ld files\n", ctxt.count );
     return map;
@@ -617,7 +726,14 @@ static bool free_entry( uint32_t index,
     (void)index;
     (void)key;
     (void)ctxt;
-    pointer_slice_free( (slice_t *)data );
+
+    name_list_t *entry = (void *)data;
+    while ( NULL != entry ) {
+        free( entry->name );
+        name_list_t *to_remove = entry;
+        entry = entry->next;
+        free( to_remove );
+    }
     return false;
 }
 

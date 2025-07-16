@@ -15,10 +15,10 @@ CC := gcc $(GDEFS)
 
 all: fdup fmis
 
-fdup:  fdup.o comp.o $(LIBS)
+fdup:  fdup.o comp.o $(LIBS) -lmagic
 	    $(CC) $(CFLAGS) -o $@ $^
 
-fmis:  fmis.o comp.o $(LIBS)
+fmis:  fmis.o comp.o $(LIBS) -lmagic
 	    $(CC) $(CFLAGS) -o $@ $^
 
 fdup.o:   fdup.c comp.h
@@ -28,6 +28,5 @@ comp.o: comp.c comp.h
 fmis.o:   fmis.c comp.h
 
 .PHONY: clean
-clean:	  
+clean:
 	  rm *.[o] fdup fmis
-

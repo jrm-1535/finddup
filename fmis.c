@@ -11,7 +11,7 @@
 void help( void )
 {
     printf( "fmis -h -nz <target-path> [[-nz] <path>]*\n\n" );
-    printf( "look for target file or for files in the target directory whose\n" );
+    printf( "look for a target file or for files in the target directory whose\n" );
     printf( "content cannot be found in any following path directories or their\n" );
     printf( "sub-directories, regardless their actual file names.\n\n" );
     printf( "Options:\n" );
@@ -36,7 +36,6 @@ void get_args( int argc, char **argv, args_t *args )
 {
     args->paths = NULL;
     args->target = NULL;
-    args->absent = true;
     args->compare = true;
     args->remove = false;
     args->confirm = false;
@@ -118,8 +117,9 @@ int main( int argc, char**argv )
                 args.paths[i].path, args.paths[i].nosub, args.paths[i].zero );
     }
 #endif
+
     map_t *map = collect_same_size_files( &args );
-    process_same_size_files( map, &args );
+    search_targets( map, &args );
     free_collected_data( map );
     free_target_n_paths( &args );
 }
